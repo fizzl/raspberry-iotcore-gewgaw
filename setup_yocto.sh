@@ -58,6 +58,7 @@ META_RPI_DIR="${LAYERS_DIR}/meta-raspberrypi"
 CONF_SNIPPETS_DIR="${YOCTO_BASE_DIR}/conf-snippets"
 RPI_CONF_FILE="${CONF_SNIPPETS_DIR}/rpi3-model-b-v1_2.conf"
 RPI_BBLAYERS_FILE="${CONF_SNIPPETS_DIR}/rpi3-model-b-v1_2.bblayers.conf.append"
+CUSTOM_LAYER_REL='${TOPDIR}/../../meta-gewgaw'
 
 ensure_repo_exists() {
   local repo_name=$1
@@ -181,6 +182,9 @@ write_rpi_bblayers_snippet() {
   cat >"${tmp_file}" <<'EOF'
 # Add Raspberry Pi BSP layer (path is relative to build directory).
 BBLAYERS:append = " ${TOPDIR}/../layers/meta-raspberrypi"
+
+# Add the project customizations layer.
+BBLAYERS:append = " ${TOPDIR}/../../meta-gewgaw"
 EOF
 
   if write_file_if_changed "${RPI_BBLAYERS_FILE}" "${tmp_file}"; then
@@ -208,6 +212,6 @@ write_rpi_bblayers_snippet
 log "Yocto setup finished successfully."
 log "Next step (manual): cd ${YOCTO_BASE_DIR}"
 log "Next step (manual): source ${OECORE_DIR}/oe-init-build-env"
-log "Next step (manual): bitbake-layers add-layer ../layers/meta-yocto/meta-yocto-bsp ../layers/meta-yocto/meta-poky ../layers/meta-raspberrypi"
+log "Next step (manual): bitbake-layers add-layer ../layers/meta-yocto/meta-yocto-bsp ../layers/meta-yocto/meta-poky ../layers/meta-raspberrypi ${CUSTOM_LAYER_REL}"
 log "Next step (manual): add the snippet in ${RPI_CONF_FILE} to build/conf/local.conf"
 log "Optional: add ${RPI_BBLAYERS_FILE} content into build/conf/bblayers.conf if you prefer manual edits over bitbake-layers add-layer"

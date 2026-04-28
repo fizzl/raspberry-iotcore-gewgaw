@@ -43,6 +43,12 @@ From the repository root:
 
 Default build image is `core-image-minimal`.
 
+By default, this project now applies a custom Yocto layer (`meta-gewgaw`) that:
+
+- enables OpenSSH server in the image
+- ensures `sshd` starts on boot
+- injects a generated root authorized key into the image
+
 To build a different image:
 
 ```bash
@@ -123,6 +129,20 @@ Each run writes logs to:
 - `logs/setup_dependencies_<timestamp>.log`
 - `logs/setup_yocto_<timestamp>.log`
 - `logs/build_image_<timestamp>.log`
+
+## SSH Access Defaults
+
+`build_image.sh` manages root SSH access idempotently:
+
+- generates `target-root.pem` if it does not already exist
+- keeps/uses `target-root.pem.pub`
+- installs the public key into root's `authorized_keys` in the target image via the custom layer
+
+The private key file remains on the build host. Use it to connect to the target:
+
+```bash
+ssh -i ./target-root.pem root@<target-ip>
+```
 
 ## Beginner Notes
 

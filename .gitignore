@@ -68,5 +68,9 @@ vcpkg_installed/
 Testing/
 .cache/
 
+# Generated target SSH keypair
+target-root.pem
+target-root.pem.pub
+
 # External Repos
 yocto/
