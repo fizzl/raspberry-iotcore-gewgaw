@@ -1,0 +1,14 @@
+[Unit]
+Description=First-boot: grow root partition and filesystem to fill SD card
+# Run only if the stamp from a previous successful run is absent.
+ConditionPathExists=!/var/lib/rootfs-grown.stamp
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/grow-rootfs.sh
+ExecStartPost=/bin/touch /var/lib/rootfs-grown.stamp
+
+[Install]
+WantedBy=multi-user.target
