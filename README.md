@@ -26,6 +26,21 @@ The flashable image lands at:
 build/tmp/deploy/images/raspberrypi3/core-image-base-raspberrypi3.wic.bz2
 ```
 
+## Flash the image to a microssd for testing
+
+```
+cd build/tmp/deploy/images/raspberrypi3
+sudo bmaptool copy \
+  --bmap core-image-base-raspberrypi3.rootfs.wic.bmap \
+  core-image-base-raspberrypi3.rootfs.wic.bz2 \
+  /dev/sdX
+sync
+```
+
+Where /dev/sdX is a writable microSD device root.
+
+After this, you can insert the microSD into the Raspberry and power it on.
+
 ## What you get
 
 - **Yocto release**: scarthgap (5.0 LTS).
