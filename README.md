@@ -15,6 +15,11 @@ On an Ubuntu / Debian host:
 Both scripts are idempotent and never discard local changes in the source
 trees they manage. Logs are written under `logs/`.
 
+`build.sh` also appends `LICENSE_FLAGS_ACCEPTED += "synaptics-killswitch"`
+so the Raspberry Pi Wi-Fi firmware packages recommended by `raspberrypi3` are
+buildable. See `meta-raspberrypi/docs/ipcompliance.md` for the upstream note on
+that license gate.
+
 The flashable image lands at:
 
 ```

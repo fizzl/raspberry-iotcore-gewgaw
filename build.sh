@@ -62,7 +62,9 @@ managed_block() {
 $MARK_BEGIN
 # Managed by build.sh — do not edit by hand; changes here will be overwritten.
 MACHINE = "$MACHINE"
+DISTRO_FEATURES:append = " usrmerge"
 DISTRO_FEATURES:append = " systemd"
+LICENSE_FLAGS_ACCEPTED:append = " synaptics-killswitch"
 VIRTUAL-RUNTIME_init_manager = "systemd"
 VIRTUAL-RUNTIME_initscripts = ""
 IMAGE_FEATURES:append = " ssh-server-openssh"
