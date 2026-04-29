@@ -1,0 +1,5 @@
+[Match]
+Name=eth0
+
+[Network]
+Address=192.168.55.5/24
