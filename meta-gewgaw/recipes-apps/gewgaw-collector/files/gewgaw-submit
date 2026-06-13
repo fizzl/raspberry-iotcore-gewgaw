@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""gewgaw-submit — PHASE 1 STUB.
+
+Modes (see scan_and_submit_daemons_design.md):
+  gewgaw-submit          steady-state upload run (hourly timer)
+  gewgaw-submit boot     boot phase: get online, sync NTP, emit boot beacon
+
+Real candidate selection, wpa_supplicant association, connectivity check,
+net_health blacklist, and the aws-iot-mqtt upload land in a later phase. For now
+this just reports which mode it was invoked in and exits cleanly.
+"""
+import sys
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "upload"
+    if mode not in ("upload", "boot"):
+        print(f"gewgaw-submit: unknown mode '{mode}' (use upload|boot)",
+              file=sys.stderr)
+        return 2
+    print(f"gewgaw-submit: PHASE 1 STUB — mode={mode}; nothing to do yet.",
+          flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

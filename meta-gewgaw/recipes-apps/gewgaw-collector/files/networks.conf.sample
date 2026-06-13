@@ -1,0 +1,20 @@
+# gewgaw known Wi-Fi networks — TEMPLATE (no secrets committed).
+#
+# The real file is /etc/gewgaw/networks.conf, created on the running device
+# (gitignored, never baked into the image). Add entries with the host helper
+# add-network.sh, or by hand. Format is wpa_supplicant-native: one network={}
+# block per known network. The submit daemon parses these blocks to learn
+# (ssid, psk, priority); higher priority is preferred. Open networks use
+# key_mgmt=NONE. Keep this file mode 0600 (it holds PSKs).
+
+#network={
+#    ssid="HomeNet"
+#    psk="superSecret123"
+#    priority=100
+#}
+#
+#network={
+#    ssid="CafeOpen"
+#    key_mgmt=NONE
+#    priority=10
+#}

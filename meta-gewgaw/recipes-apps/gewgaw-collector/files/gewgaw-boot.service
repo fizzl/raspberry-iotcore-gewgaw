@@ -1,0 +1,11 @@
+[Unit]
+Description=gewgaw boot beacon (get online, sync NTP, announce boot to AWS IoT)
+After=gewgaw-collector.service network.target bluetooth.service
+Wants=gewgaw-collector.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/gewgaw-submit boot
+
+[Install]
+WantedBy=multi-user.target

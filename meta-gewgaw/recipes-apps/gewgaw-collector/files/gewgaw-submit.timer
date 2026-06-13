@@ -1,0 +1,9 @@
+[Unit]
+Description=Run gewgaw submit hourly
+
+[Timer]
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

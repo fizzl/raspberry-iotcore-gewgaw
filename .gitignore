@@ -92,3 +92,20 @@ meta-gewgaw/recipes-iot/aws-iot/files/certs/*.key
 meta-gewgaw/recipes-iot/aws-iot/files/certs/*.pem
 device.crt
 device.key
+
+# gewgaw Wi-Fi credentials — the real networks.conf holds PSKs and lives on the
+# device at runtime; only networks.conf.sample is tracked.
+networks.conf
+meta-gewgaw/recipes-apps/gewgaw-collector/files/networks.conf
+
+# Local SQLite sighting databases (pulled off a device for inspection, etc.)
+*.db
+*.db-wal
+*.db-shm
+
+# Python bytecode cache (e.g. from local syntax checks of the daemons).
+__pycache__/
+*.pyc
+
+# Design / scratch docs — not committed.
+*_design.md

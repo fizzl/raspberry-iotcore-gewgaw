@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""gewgaw-collector — PHASE 1 STUB.
+
+Initializes the SQLite store from the shipped schema and idles. The real
+Wi-Fi/BLE scan loop, session model, and radio arbiter land in a later phase
+(see scan_and_submit_daemons_design.md). Keeping this a long-running stub lets
+the systemd unit, DB, and Python/sqlite3 stack be validated on-device now.
+"""
+import os
+import sqlite3
+import time
+
+CONF = os.environ.get("GEWGAW_CONF", "/etc/gewgaw/gewgaw.conf")
+SCHEMA = "/usr/share/gewgaw/schema.sql"
+
+
+def load_conf(path):
+    """Parse the shell-style KEY=VALUE config into a dict (best effort)."""
+    cfg = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                # Strip inline comments and surrounding quotes.
+                val = val.split("#", 1)[0].strip().strip('"').strip("'")
+                cfg[key.strip()] = val
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+def init_db(db_path):
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        with open(SCHEMA) as f:
+            conn.executescript(f.read())
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def main():
+    cfg = load_conf(CONF)
+    db_path = cfg.get("GEWGAW_DB", "/var/lib/gewgaw/gewgaw.db")
+    sock = cfg.get("GEWGAW_SOCK", "/run/gewgaw/arbiter.sock")
+    os.makedirs(os.path.dirname(sock), exist_ok=True)
+
+    init_db(db_path)
+    print(f"gewgaw-collector: PHASE 1 STUB — initialized {db_path}; idling.",
+          flush=True)
+
+    while True:
+        time.sleep(3600)
+
+
+if __name__ == "__main__":
+    main()

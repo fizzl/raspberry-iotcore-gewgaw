@@ -1,0 +1,14 @@
+[Unit]
+Description=gewgaw onboard collector (Wi-Fi + BLE -> sqlite)
+After=bluetooth.service network.target
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /run/gewgaw /var/lib/gewgaw
+ExecStart=/usr/bin/gewgaw-collector
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

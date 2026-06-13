@@ -1,0 +1,8 @@
+[Unit]
+Description=gewgaw opportunistic submit (upload new sightings to AWS IoT)
+After=gewgaw-collector.service
+Wants=gewgaw-collector.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/gewgaw-submit
