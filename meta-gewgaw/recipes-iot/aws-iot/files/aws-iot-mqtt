@@ -1,0 +1,59 @@
+#!/bin/sh
+# Minimal AWS IoT Core MQTT helper over mutual-TLS, built on mosquitto clients.
+#
+# Usage:
+#   aws-iot-mqtt pub [topic] [message]   publish (defaults from aws-iot.conf)
+#   aws-iot-mqtt sub [topic]             subscribe and stream messages
+#   aws-iot-mqtt check                   one-shot connectivity self-test
+#
+# Connection parameters come from /etc/aws-iot/aws-iot.conf.
+set -eu
+
+CONF="${AWS_IOT_CONF:-/etc/aws-iot/aws-iot.conf}"
+[ -r "$CONF" ] || { echo "aws-iot-mqtt: missing config $CONF" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$CONF"
+
+die() { echo "aws-iot-mqtt: $*" >&2; exit 1; }
+
+require_certs() {
+    [ -r "$AWS_IOT_CAFILE" ]   || die "CA file not found: $AWS_IOT_CAFILE"
+    [ -r "$AWS_IOT_CERTFILE" ] || die "device cert not found: $AWS_IOT_CERTFILE (run provision-device.sh from the host)"
+    [ -r "$AWS_IOT_KEYFILE" ]  || die "device key not found: $AWS_IOT_KEYFILE (run provision-device.sh from the host)"
+}
+
+tls_args() {
+    # AWS IoT requires SNI; mosquitto sends it from -h automatically on :8883.
+    printf '%s' "--cafile $AWS_IOT_CAFILE --cert $AWS_IOT_CERTFILE --key $AWS_IOT_KEYFILE \
+-h $AWS_IOT_ENDPOINT -p $AWS_IOT_PORT --tls-version tlsv1.2 -i $AWS_IOT_CLIENT_ID"
+}
+
+cmd="${1:-check}"
+case "$cmd" in
+    pub)
+        require_certs
+        topic="${2:-$AWS_IOT_TOPIC}"
+        msg="${3:-{\"hello\":\"gewgaw\",\"ts\":$(date +%s)}}"
+        # shellcheck disable=SC2046
+        exec mosquitto_pub $(tls_args) -q 1 -t "$topic" -m "$msg"
+        ;;
+    sub)
+        require_certs
+        topic="${2:-$AWS_IOT_TOPIC}"
+        # shellcheck disable=SC2046
+        exec mosquitto_sub $(tls_args) -q 1 -t "$topic" -v
+        ;;
+    check)
+        require_certs
+        topic="${AWS_IOT_TOPIC}/selftest"
+        # shellcheck disable=SC2046
+        if mosquitto_pub $(tls_args) -q 1 -t "$topic" -m "selftest $(date +%s)" >/dev/null 2>&1; then
+            echo "aws-iot-mqtt: OK — connected and published to $topic"
+        else
+            die "self-test failed — check certs, policy, endpoint, and network"
+        fi
+        ;;
+    *)
+        die "unknown command '$cmd' (use pub|sub|check)"
+        ;;
+esac

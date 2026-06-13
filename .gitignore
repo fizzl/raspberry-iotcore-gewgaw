@@ -79,3 +79,16 @@ meta-raspberrypi/
 downloads/
 sstate-cache/
 logs/
+
+# meta-openembedded is cloned by setup.sh, like poky / meta-raspberrypi.
+meta-openembedded/
+
+# AWS IoT material — never commit device secrets, the fetched CA, or the
+# account-specific connection config (only aws-iot.conf.sample is tracked).
+meta-gewgaw/recipes-iot/aws-iot/files/AmazonRootCA1.pem
+meta-gewgaw/recipes-iot/aws-iot/files/aws-iot.conf
+meta-gewgaw/recipes-iot/aws-iot/files/certs/*.crt
+meta-gewgaw/recipes-iot/aws-iot/files/certs/*.key
+meta-gewgaw/recipes-iot/aws-iot/files/certs/*.pem
+device.crt
+device.key

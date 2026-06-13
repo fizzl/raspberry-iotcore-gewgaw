@@ -50,7 +50,26 @@ There is no test suite; iteration means re-running `build.sh` and booting the im
   - `network-config-static` → systemd-networkd `.network` giving eth0 `192.168.55.5/24`
   - `target-root-authorized-keys` → root `authorized_keys` + sshd_config.d snippet forcing pubkey auth
   - `grow-rootfs` → first-boot systemd oneshot that expands the root partition/ext4 to fill the SD card
+  - `aws-iot-mqtt` (`recipes-iot/`) → mosquitto-based mutual-TLS MQTT helper (`/usr/bin/aws-iot-mqtt pub|sub|check`), `/etc/aws-iot/aws-iot.conf`, the public `AmazonRootCA1.pem`, and a first-boot `aws-iot-provision.service` self-test. Pulls `mosquitto-clients` from `meta-openembedded/meta-networking` (cloned by `setup.sh`, layers registered in `build.sh`).
   - `wic/sdimage-gewgaw.wks` → the partition layout (`WKS_FILE`); root partition is grown on first boot, not at image time
+
+- **AWS IoT cert flow**: device cert + private key are **never** baked into the image or
+  committed (both gitignored). `setup.sh` fetches the public `AmazonRootCA1.pem` into the
+  recipe's `files/`. The per-device cert/key are pushed to the running target over SSH by
+  `provision-device.sh <device.crt> <device.key>` into `/etc/aws-iot/certs/`, then
+  `aws-iot-mqtt check` self-tests. Account-specific values (ATS endpoint, thing name)
+  are NOT committed: only `aws-iot.conf.sample` is tracked, and `setup.sh` generates the
+  gitignored `aws-iot.conf` from `$AWS_IOT_ENDPOINT`/`$AWS_IOT_THING` or via AWS CLI
+  lookup. The device IoT policy should be scoped to `iot:Connect` as the device's client
+  id and pub/sub/receive under `gewgaw/<thing>/*`.
+
+- **Dev Wi-Fi**: the image already ships the Pi 3 WLAN stack (`kernel-module-brcmfmac`,
+  `linux-firmware-rpidistro-bcm43430`, `wpa-supplicant`, `iw`) — only config is missing.
+  `setup-wlan.sh <SSID> [PSK]` pushes a `wpa_supplicant-wlan0.conf` (PSK hashed on-device
+  via `wpa_passphrase`) and a `25-wlan0.network` (DHCP) to the running target over eth0,
+  enables `wpa_supplicant@wlan0`, and verifies internet. Like `provision-device.sh` it is
+  runtime-only: nothing baked into the image, no Wi-Fi secret committed, re-run after each
+  flash. Both host scripts use reflash-tolerant SSH opts (no host-key checking).
 
 When adding a feature to the image you generally add a recipe under
 `meta-gewgaw/recipes-*/` and append its package name to `IMAGE_INSTALL` in

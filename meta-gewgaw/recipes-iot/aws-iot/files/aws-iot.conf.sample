@@ -1,0 +1,22 @@
+# gewgaw AWS IoT Core connection settings — TEMPLATE.
+#
+# setup.sh generates the real (gitignored) aws-iot.conf from this file, filling
+# in the endpoint/thing from $AWS_IOT_ENDPOINT / $AWS_IOT_THING or by querying
+# the AWS CLI. Do NOT put account-specific values in this committed template.
+# Sourced on the device by /usr/bin/aws-iot-mqtt.
+
+# AWS IoT Core ATS data endpoint, e.g. xxxxxxxxxxxx-ats.iot.<region>.amazonaws.com
+AWS_IOT_ENDPOINT="__AWS_IOT_ENDPOINT__"
+AWS_IOT_PORT="8883"
+
+# MQTT client id. AWS policy may pin connections to thing name == client id.
+AWS_IOT_CLIENT_ID="__AWS_IOT_THING__"
+
+# Default topic used by the test/publish helper.
+AWS_IOT_TOPIC="gewgaw/__AWS_IOT_THING__/test"
+
+# TLS material. The CA is baked into the image; the device cert + key are
+# provisioned out-of-band (see provision-device.sh) and must NOT be committed.
+AWS_IOT_CAFILE="/etc/aws-iot/AmazonRootCA1.pem"
+AWS_IOT_CERTFILE="/etc/aws-iot/certs/device.crt"
+AWS_IOT_KEYFILE="/etc/aws-iot/certs/device.key"

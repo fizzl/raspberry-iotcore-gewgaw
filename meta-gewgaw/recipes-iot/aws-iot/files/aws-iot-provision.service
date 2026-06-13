@@ -1,0 +1,18 @@
+[Unit]
+Description=AWS IoT first-boot provisioning check (verify cert material is present)
+# Only runs until provisioning has succeeded once.
+ConditionPathExists=!/var/lib/aws-iot-provisioned.stamp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Self-test connects to AWS IoT with the provisioned mutual-TLS material.
+# Stamp is written only on success, so the check retries on every boot
+# until the device cert + key have been provisioned over SSH.
+ExecStart=/usr/bin/aws-iot-mqtt check
+ExecStartPost=/bin/touch /var/lib/aws-iot-provisioned.stamp
+
+[Install]
+WantedBy=multi-user.target

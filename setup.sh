@@ -10,9 +10,13 @@
 # Override knobs (env vars):
 #   POKY_REF       — git ref for poky          (default: scarthgap)
 #   META_RPI_REF   — git ref for meta-raspberrypi (default: scarthgap)
+#   META_OE_REF    — git ref for meta-openembedded (default: scarthgap)
 #   POKY_URL       — poky remote               (default: git://git.yoctoproject.org/poky)
 #   META_RPI_URL   — meta-raspberrypi remote   (default: https://github.com/agherzan/meta-raspberrypi.git)
+#   META_OE_URL    — meta-openembedded remote  (default: https://github.com/openembedded/meta-openembedded.git)
 #   SKIP_APT=1     — skip the apt-get install step (e.g. on non-Debian hosts)
+#   AWS_IOT_ENDPOINT — ATS data endpoint for aws-iot.conf (default: AWS CLI lookup)
+#   AWS_IOT_THING    — thing name / MQTT client id        (default: AWS CLI lookup)
 
 set -euo pipefail
 
@@ -21,8 +25,20 @@ cd "$REPO_ROOT"
 
 POKY_REF="${POKY_REF:-scarthgap}"
 META_RPI_REF="${META_RPI_REF:-scarthgap}"
+META_OE_REF="${META_OE_REF:-scarthgap}"
 POKY_URL="${POKY_URL:-git://git.yoctoproject.org/poky}"
 META_RPI_URL="${META_RPI_URL:-https://github.com/agherzan/meta-raspberrypi.git}"
+META_OE_URL="${META_OE_URL:-https://github.com/openembedded/meta-openembedded.git}"
+
+# Public Amazon Root CA 1, staged into the aws-iot recipe so the device can
+# verify the AWS IoT endpoint. This is a public certificate — not a secret.
+AMAZON_ROOT_CA_URL="${AMAZON_ROOT_CA_URL:-https://www.amazontrust.com/repository/AmazonRootCA1.pem}"
+
+# AWS IoT connection identity. These are account-specific, so they live only in
+# the generated (gitignored) aws-iot.conf — never in the committed template.
+# Left empty here: resolved from the environment or the AWS CLI at setup time.
+AWS_IOT_ENDPOINT="${AWS_IOT_ENDPOINT:-}"
+AWS_IOT_THING="${AWS_IOT_THING:-}"
 
 # --- logging --------------------------------------------------------------
 mkdir -p logs
@@ -153,10 +169,62 @@ generate_ssh_key() {
     fi
 }
 
+stage_amazon_root_ca() {
+    local dest="$REPO_ROOT/meta-gewgaw/recipes-iot/aws-iot/files/AmazonRootCA1.pem"
+    if [[ -s "$dest" ]]; then
+        log "Amazon Root CA already staged; leaving it as-is."
+        return
+    fi
+    log "Fetching Amazon Root CA from $AMAZON_ROOT_CA_URL"
+    install -d "$(dirname "$dest")"
+    wget -qO "$dest" "$AMAZON_ROOT_CA_URL" \
+        || die "failed to download Amazon Root CA from $AMAZON_ROOT_CA_URL"
+    grep -q "BEGIN CERTIFICATE" "$dest" \
+        || { rm -f "$dest"; die "downloaded Amazon Root CA looks invalid"; }
+}
+
+generate_aws_iot_conf() {
+    local dir="$REPO_ROOT/meta-gewgaw/recipes-iot/aws-iot/files"
+    local sample="$dir/aws-iot.conf.sample"
+    local dest="$dir/aws-iot.conf"
+
+    [[ -f "$sample" ]] || die "missing $sample"
+    if [[ -f "$dest" ]]; then
+        log "aws-iot.conf already present; leaving it as-is."
+        return
+    fi
+
+    # Resolve endpoint/thing: explicit env wins, else ask the AWS CLI (best
+    # effort — owner convenience; failures fall back to template placeholders).
+    local endpoint="$AWS_IOT_ENDPOINT" thing="$AWS_IOT_THING"
+    if [[ -z "$endpoint" ]] && command -v aws >/dev/null 2>&1; then
+        endpoint="$(aws iot describe-endpoint --endpoint-type iot:Data-ATS \
+            --query endpointAddress --output text 2>/dev/null || true)"
+    fi
+    if [[ -z "$thing" ]] && command -v aws >/dev/null 2>&1; then
+        thing="$(aws iot list-things --max-results 1 \
+            --query 'things[0].thingName' --output text 2>/dev/null || true)"
+        [[ "$thing" == "None" ]] && thing=""
+    fi
+
+    log "Generating aws-iot.conf (endpoint='${endpoint:-<unset>}', thing='${thing:-<unset>}')"
+    sed -e "s|__AWS_IOT_ENDPOINT__|${endpoint}|g" \
+        -e "s|__AWS_IOT_THING__|${thing}|g" \
+        "$sample" > "$dest"
+
+    if [[ -z "$endpoint" || -z "$thing" ]]; then
+        log "WARNING: aws-iot.conf has unresolved fields — edit $dest or set"
+        log "         AWS_IOT_ENDPOINT / AWS_IOT_THING and re-run, before ./build.sh."
+    fi
+}
+
 # --- main -----------------------------------------------------------------
 install_host_packages
 sync_repo "$POKY_URL"     "$POKY_REF"     "$REPO_ROOT/poky"
 sync_repo "$META_RPI_URL" "$META_RPI_REF" "$REPO_ROOT/meta-raspberrypi"
+sync_repo "$META_OE_URL"  "$META_OE_REF"  "$REPO_ROOT/meta-openembedded"
 generate_ssh_key
+stage_amazon_root_ca
+generate_aws_iot_conf
 
 log "Setup complete. Next: ./build.sh"
