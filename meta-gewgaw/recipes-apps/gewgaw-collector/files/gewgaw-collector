@@ -1,22 +1,57 @@
 #!/usr/bin/env python3
-"""gewgaw-collector — PHASE 1 STUB.
+"""gewgaw-collector — Wi-Fi AP + BLE presence collector (phase 2).
 
-Initializes the SQLite store from the shipped schema and idles. The real
-Wi-Fi/BLE scan loop, session model, and radio arbiter land in a later phase
-(see scan_and_submit_daemons_design.md). Keeping this a long-running stub lets
-the systemd unit, DB, and Python/sqlite3 stack be validated on-device now.
+Long-running daemon. Every SCAN_INTERVAL it:
+  1. scans 2.4 GHz Wi-Fi APs via `iw dev <iface> scan`,
+  2. runs a BLE discovery window via `bluetoothctl` and keeps the devices that
+     are in range *now* (RSSI present in `bluetoothctl info`),
+  3. folds every observation into the SQLite presence model (devices + sessions),
+  4. reaps sessions whose last sighting is older than SESSION_GAP.
+
+The presence model (see scan_and_submit_daemons_design.md §5/§7): a `devices` row
+is the stable identity of a thing ever seen; a `sessions` row is one contiguous
+interval it was visible. A device present continuously is ONE growing session;
+disappearing past SESSION_GAP and returning opens a SECOND session. That gives a
+"seen / gone / back / gone" timeline without a row per scan.
+
+Phase boundaries: the radio arbiter (design §6) and the submit/upload path are
+later phases — this daemon only scans and records. Because there is no arbiter
+yet, Wi-Fi scanning runs every cycle unconditionally; once the arbiter lands it
+will gate the Wi-Fi scan while submit holds the radio (BLE keeps running).
 """
+import json
 import os
+import re
+import signal
 import sqlite3
+import subprocess
+import sys
+import threading
 import time
 
 CONF = os.environ.get("GEWGAW_CONF", "/etc/gewgaw/gewgaw.conf")
 SCHEMA = "/usr/share/gewgaw/schema.sql"
 
+# Fallbacks for anything missing from the config file.
+DEFAULTS = {
+    "GEWGAW_DB": "/var/lib/gewgaw/gewgaw.db",
+    "GEWGAW_SOCK": "/run/gewgaw/arbiter.sock",
+    "WIFI_IFACE": "wlan0",
+    "SCAN_INTERVAL": "30",
+    "BLE_SCAN_SECONDS": "10",
+    "SESSION_GAP": "300",
+}
+
+_stop = threading.Event()
+
+
+def log(msg):
+    print(f"gewgaw-collector: {msg}", flush=True)
+
 
 def load_conf(path):
-    """Parse the shell-style KEY=VALUE config into a dict (best effort)."""
-    cfg = {}
+    """Parse the shell-style KEY=VALUE config into a dict, over DEFAULTS."""
+    cfg = dict(DEFAULTS)
     try:
         with open(path) as f:
             for line in f:
@@ -28,9 +63,21 @@ def load_conf(path):
                 val = val.split("#", 1)[0].strip().strip('"').strip("'")
                 cfg[key.strip()] = val
     except FileNotFoundError:
-        pass
+        log(f"config {path} not found; using defaults")
     return cfg
 
+
+def run(cmd, timeout=30):
+    """Run a command, return stdout (str). Never raises; '' on any failure."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        log(f"command failed: {' '.join(cmd)}: {e}")
+        return ""
+
+
+# --- database -------------------------------------------------------------
 
 def init_db(db_path):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -43,19 +90,286 @@ def init_db(db_path):
         conn.close()
 
 
+def connect_db(db_path):
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
+# --- observation model ----------------------------------------------------
+
+class Observation:
+    """One thing seen in one scan cycle."""
+    __slots__ = ("kind", "address", "rssi", "meta")
+
+    def __init__(self, kind, address, rssi, meta):
+        self.kind = kind
+        self.address = address          # BSSID / BLE MAC, lower-case
+        self.rssi = rssi                # int dBm or None
+        self.meta = meta                # dict, JSON-serialisable
+
+
+def _merge_meta(existing_json, new_meta):
+    """Merge freshly-seen metadata over what we stored before (non-None wins)."""
+    try:
+        merged = json.loads(existing_json) if existing_json else {}
+    except (ValueError, TypeError):
+        merged = {}
+    for k, v in new_meta.items():
+        if v is not None:
+            merged[k] = v
+    return merged
+
+
+def _min_n(a, b):
+    return b if a is None else (a if b is None else min(a, b))
+
+
+def _max_n(a, b):
+    return b if a is None else (a if b is None else max(a, b))
+
+
+def record_observation(conn, obs, now, gap, clock_synced):
+    """Upsert the device and fold the sighting into its open/new session."""
+    cur = conn.cursor()
+    cur.execute("SELECT id, meta FROM devices WHERE kind=? AND address=?",
+                (obs.kind, obs.address))
+    row = cur.fetchone()
+    if row is None:
+        cur.execute(
+            "INSERT INTO devices(kind, address, first_seen, last_seen, meta) "
+            "VALUES(?,?,?,?,?)",
+            (obs.kind, obs.address, now, now, json.dumps(obs.meta)))
+        device_id = cur.lastrowid
+    else:
+        device_id = row["id"]
+        merged = _merge_meta(row["meta"], obs.meta)
+        cur.execute("UPDATE devices SET last_seen=?, meta=? WHERE id=?",
+                    (now, json.dumps(merged), device_id))
+
+    cur.execute(
+        "SELECT id, last_sight, rssi_min, rssi_max FROM sessions "
+        "WHERE device_id=? AND ended_at IS NULL", (device_id,))
+    sess = cur.fetchone()
+
+    if sess is not None and now - sess["last_sight"] <= gap:
+        cur.execute(
+            "UPDATE sessions SET last_sight=?, sighting_count=sighting_count+1, "
+            "rssi_min=?, rssi_max=?, rssi_last=? WHERE id=?",
+            (now, _min_n(sess["rssi_min"], obs.rssi),
+             _max_n(sess["rssi_max"], obs.rssi), obs.rssi, sess["id"]))
+    else:
+        if sess is not None:
+            # Stale open session — close it at its real last sighting.
+            cur.execute("UPDATE sessions SET ended_at=last_sight WHERE id=?",
+                        (sess["id"],))
+        cur.execute(
+            "INSERT INTO sessions(device_id, started_at, last_sight, "
+            "sighting_count, rssi_min, rssi_max, rssi_last, clock_synced) "
+            "VALUES(?,?,?,1,?,?,?,?)",
+            (device_id, now, now, obs.rssi, obs.rssi, obs.rssi, clock_synced))
+
+
+def reap_sessions(conn, now, gap):
+    """Close any open session not seen within SESSION_GAP."""
+    conn.execute(
+        "UPDATE sessions SET ended_at=last_sight "
+        "WHERE ended_at IS NULL AND ? - last_sight > ?", (now, gap))
+
+
+# --- Wi-Fi scanning -------------------------------------------------------
+
+def freq_to_channel(freq):
+    """2.4 GHz only: 2412->1 .. 2472->13, 2484->14."""
+    if freq is None:
+        return None
+    if freq == 2484:
+        return 14
+    if 2412 <= freq <= 2472:
+        return (freq - 2407) // 5
+    return None
+
+
+def _finalize_bss(b):
+    if b["rsn"]:
+        enc = "wpa3" if b["sae"] else "wpa2"
+    elif b["wpa"]:
+        enc = "wpa"
+    elif b["privacy"]:
+        enc = "wep"
+    else:
+        enc = "open"
+    meta = {"ssid": b["ssid"], "channel": freq_to_channel(b["freq"]),
+            "freq": b["freq"], "enc": enc}
+    return Observation("wifi_ap", b["bssid"], b["signal"], meta)
+
+
+def parse_iw_scan(text):
+    """Parse `iw dev <iface> scan` output into wifi_ap observations."""
+    out = []
+    cur = None
+    for line in text.splitlines():
+        m = re.match(r"^BSS ([0-9a-fA-F:]{17})", line)
+        if m:
+            if cur is not None:
+                out.append(_finalize_bss(cur))
+            cur = {"bssid": m.group(1).lower(), "ssid": None, "signal": None,
+                   "freq": None, "rsn": False, "wpa": False, "privacy": False,
+                   "sae": False}
+            continue
+        if cur is None:
+            continue
+        s = line.strip()
+        if s.startswith("freq:"):
+            try:
+                cur["freq"] = int(float(s.split(":", 1)[1]))
+            except ValueError:
+                pass
+        elif s.startswith("signal:"):
+            try:
+                cur["signal"] = int(round(float(s.split(":", 1)[1].split()[0])))
+            except (ValueError, IndexError):
+                pass
+        elif s.startswith("SSID:"):
+            cur["ssid"] = s[5:].strip() or None
+        elif s.startswith("RSN:"):
+            cur["rsn"] = True
+        elif s.startswith("WPA:"):
+            cur["wpa"] = True
+        elif s.startswith("capability:") and "Privacy" in s:
+            cur["privacy"] = True
+        elif "Authentication suites:" in s and "SAE" in s:
+            cur["sae"] = True
+    if cur is not None:
+        out.append(_finalize_bss(cur))
+    return out
+
+
+def scan_wifi(iface):
+    return parse_iw_scan(run(["iw", "dev", iface, "scan"], timeout=30))
+
+
+# --- BLE scanning ---------------------------------------------------------
+
+def ensure_bt_powered():
+    """Best-effort: power the controller on so discovery works."""
+    run(["bluetoothctl", "power", "on"], timeout=10)
+
+
+def list_ble_devices():
+    """MACs bluez currently knows about (`bluetoothctl devices`)."""
+    macs = []
+    for line in run(["bluetoothctl", "devices"], timeout=10).splitlines():
+        m = re.match(r"Device ([0-9A-Fa-f:]{17})", line.strip())
+        if m:
+            macs.append(m.group(1))
+    return macs
+
+
+def parse_ble_info(mac, text):
+    """An Observation if the device is in range now (has an RSSI), else None."""
+    rssi = name = addr_type = None
+    for line in text.splitlines():
+        s = line.strip()
+        m = re.match(r"Device [0-9A-Fa-f:]{17} \((\w+)\)", s)
+        if m:
+            addr_type = m.group(1)
+        elif s.startswith("Name:"):
+            name = s[5:].strip()
+        elif s.startswith("RSSI:"):
+            try:
+                rssi = int(s.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+    if rssi is None:
+        return None     # stale bluez cache entry, not in range this window
+    return Observation("ble", mac.lower(), rssi,
+                       {"ble_name": name, "addr_type": addr_type})
+
+
+def scan_ble(seconds):
+    """Run a timed discovery window, then keep devices reporting an RSSI."""
+    # `--timeout` runs the session for N seconds then exits.
+    run(["bluetoothctl", "--timeout", str(seconds), "scan", "on"],
+        timeout=seconds + 15)
+    obs = []
+    for mac in list_ble_devices():
+        rec = parse_ble_info(mac, run(["bluetoothctl", "info", mac], timeout=10))
+        if rec is not None:
+            obs.append(rec)
+    return obs
+
+
+# --- misc -----------------------------------------------------------------
+
+def clock_is_synced():
+    out = run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+              timeout=10)
+    return 1 if out.strip() == "yes" else 0
+
+
+def ensure_iface_up(iface):
+    """Bring the Wi-Fi interface up so scanning works before networkd does."""
+    run(["ip", "link", "set", iface, "up"], timeout=10)
+
+
+def _on_signal(signum, frame):
+    _stop.set()
+
+
+# --- main -----------------------------------------------------------------
+
 def main():
     cfg = load_conf(CONF)
-    db_path = cfg.get("GEWGAW_DB", "/var/lib/gewgaw/gewgaw.db")
-    sock = cfg.get("GEWGAW_SOCK", "/run/gewgaw/arbiter.sock")
-    os.makedirs(os.path.dirname(sock), exist_ok=True)
+    db_path = cfg["GEWGAW_DB"]
+    iface = cfg["WIFI_IFACE"]
+    scan_interval = int(cfg["SCAN_INTERVAL"])
+    ble_seconds = int(cfg["BLE_SCAN_SECONDS"])
+    gap = int(cfg["SESSION_GAP"])
 
+    os.makedirs(os.path.dirname(cfg["GEWGAW_SOCK"]), exist_ok=True)
     init_db(db_path)
-    print(f"gewgaw-collector: PHASE 1 STUB — initialized {db_path}; idling.",
-          flush=True)
+    conn = connect_db(db_path)
 
-    while True:
-        time.sleep(3600)
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+
+    ensure_iface_up(iface)
+    ensure_bt_powered()
+    log(f"started; db={db_path} iface={iface} interval={scan_interval}s "
+        f"ble_window={ble_seconds}s session_gap={gap}s")
+
+    while not _stop.is_set():
+        cycle = time.monotonic()
+        synced = clock_is_synced()
+
+        # Phase 3: the arbiter will gate this Wi-Fi scan while submit holds the
+        # radio. For now it always runs.
+        wifi = scan_wifi(iface)
+        now = int(time.time())
+        for o in wifi:
+            record_observation(conn, o, now, gap, synced)
+
+        # BLE is the independent side of the combo chip — always safe to scan.
+        ble = scan_ble(ble_seconds)
+        now = int(time.time())
+        for o in ble:
+            record_observation(conn, o, now, gap, synced)
+
+        reap_sessions(conn, int(time.time()), gap)
+        conn.commit()
+        log(f"cycle: {len(wifi)} wifi AP(s), {len(ble)} BLE device(s) "
+            f"(clock_synced={synced})")
+
+        slept = time.monotonic() - cycle
+        _stop.wait(max(0, scan_interval - slept))
+
+    conn.close()
+    log("stopped")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
