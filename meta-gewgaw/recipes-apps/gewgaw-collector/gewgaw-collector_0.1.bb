@@ -4,8 +4,11 @@ SQLite presence database (gewgaw-collector) and opportunistically uploads new \
 observations to AWS IoT Core over known/open Wi-Fi (gewgaw-submit), including a \
 first-connect boot beacon. See scan_and_submit_daemons_design.md. \
 NOTE: the collector does real Wi-Fi + BLE scanning into the SQLite presence \
-model (phase 2); the radio arbiter and gewgaw-submit upload path are later \
-phases (gewgaw-submit is still a stub)."
+model (phase 2) and hosts the single-radio arbiter at GEWGAW_SOCK (phase 3); \
+gewgaw-submit does the real steady-state upload (candidate selection, \
+wpa_supplicant association, 204 connectivity check, batched publish via \
+aws-iot-mqtt) (phase 4). Its boot-beacon mode and the net_health blacklist are \
+later phases."
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
@@ -33,7 +36,7 @@ SYSTEMD_SERVICE:${PN} = "gewgaw-collector.service gewgaw-submit.timer gewgaw-boo
 
 # python3 + sqlite3 for the daemons; iw/wpa-supplicant/bluez5/iproute2 for
 # capture and the opportunistic uplink; aws-iot-mqtt for the actual publish.
-RDEPENDS:${PN} = "python3-core python3-sqlite3 iw wpa-supplicant bluez5 iproute2 aws-iot-mqtt"
+RDEPENDS:${PN} = "python3-core python3-json python3-io python3-sqlite3 iw wpa-supplicant bluez5 iproute2 aws-iot-mqtt"
 
 # Pure-data recipe — nothing to compile or configure.
 do_compile[noexec] = "1"

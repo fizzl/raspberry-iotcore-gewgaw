@@ -1,26 +1,486 @@
 #!/usr/bin/env python3
-"""gewgaw-submit — PHASE 1 STUB.
+"""gewgaw-submit — opportunistic uploader (phase 4: steady-state upload mode).
 
-Modes (see scan_and_submit_daemons_design.md):
+Modes (see scan_and_submit_daemons_design.md §8):
   gewgaw-submit          steady-state upload run (hourly timer)
-  gewgaw-submit boot     boot phase: get online, sync NTP, emit boot beacon
+  gewgaw-submit boot     boot phase / first-connect beacon  [PHASE 5 — still stub]
 
-Real candidate selection, wpa_supplicant association, connectivity check,
-net_health blacklist, and the aws-iot-mqtt upload land in a later phase. For now
-this just reports which mode it was invoked in and exits cleanly.
+Steady-state run (this phase):
+  1. Count closed, unsynced sessions; nothing queued => exit.
+  2. Candidate selection: APs the collector can see *now* (its open `wifi_ap`
+     sessions, last sighting within SESSION_GAP) that are either a configured
+     known network (PSK) or, with ALLOW_OPEN, open.
+  3. ACQUIRE the radio lease from the collector's arbiter (§6) so the collector
+     stops scanning Wi-Fi while we retune the single radio.
+  4. For each candidate (capped at MAX_ATTEMPTS): write a transient single-network
+     wpa_supplicant conf, (re)start wpa_supplicant@<iface>, wait for association
+     + an IPv4 lease, then a 204 connectivity check. First good link wins.
+  5. On internet: upload closed unsynced sessions in batches via `aws-iot-mqtt
+     pub` to gewgaw/<thing>/sightings; mark rows synced only after pub exits 0.
+  6. Teardown (stop supplicant, flush wlan0, delete transient conf) + RELEASE.
+
+Later phases (hooks marked inline): per-BSSID net_health blacklist (§9), the
+events/boot-beacon flush to gewgaw/<thing>/status (§5.4/§8.1), and multi-network
+priority/reputation polish.
 """
+import json
+import os
+import re
+import socket
+import sqlite3
+import subprocess
 import sys
+import time
+
+CONF = os.environ.get("GEWGAW_CONF", "/etc/gewgaw/gewgaw.conf")
+AWS_CONF = os.environ.get("AWS_IOT_CONF", "/etc/aws-iot/aws-iot.conf")
+
+# Fallbacks for anything missing from the config file.
+DEFAULTS = {
+    "GEWGAW_DB": "/var/lib/gewgaw/gewgaw.db",
+    "GEWGAW_SOCK": "/run/gewgaw/arbiter.sock",
+    "WIFI_IFACE": "wlan0",
+    "SESSION_GAP": "300",
+    "KNOWN_NETWORKS": "/etc/gewgaw/networks.conf",
+    "ALLOW_OPEN": "1",
+    "MAX_ATTEMPTS": "4",
+    "LEASE_SECONDS": "180",
+    "CONNECT_TIMEOUT": "45",
+    "HTTP_CHECK_URL": "http://connectivitycheck.gstatic.com/generate_204",
+    "SUBMIT_BATCH": "200",
+}
+
+
+def log(msg):
+    print(f"gewgaw-submit: {msg}", flush=True)
+
+
+def load_conf(path):
+    """Parse the shell-style KEY=VALUE config into a dict, over DEFAULTS."""
+    cfg = dict(DEFAULTS)
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                val = val.split("#", 1)[0].strip().strip('"').strip("'")
+                cfg[key.strip()] = val
+    except FileNotFoundError:
+        log(f"config {path} not found; using defaults")
+    return cfg
+
+
+def run(cmd, timeout=30, combine=False):
+    """Run a command; return (returncode, output). Never raises."""
+    try:
+        p = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout)
+        out = p.stdout + (p.stderr if combine else "")
+        return p.returncode, out
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        log(f"command failed: {' '.join(cmd)}: {e}")
+        return 1, ""
+
+
+# --- config-derived bits --------------------------------------------------
+
+def read_topic_base(aws_conf):
+    """Derive gewgaw/<thing> from aws-iot.conf's AWS_IOT_TOPIC (…/<thing>/test)."""
+    try:
+        with open(aws_conf) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("AWS_IOT_TOPIC"):
+                    val = line.partition("=")[2].strip().strip('"').strip("'")
+                    return val.rsplit("/", 1)[0] if "/" in val else val
+    except FileNotFoundError:
+        pass
+    return None
+
+
+# --- database -------------------------------------------------------------
+
+def connect_db(db_path):
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
+def count_pending(conn):
+    return conn.execute(
+        "SELECT COUNT(*) FROM sessions WHERE ended_at IS NOT NULL "
+        "AND synced = 0").fetchone()[0]
+
+
+def visible_aps(conn, gap, now):
+    """APs the collector currently sees: open wifi_ap sessions within SESSION_GAP."""
+    rows = conn.execute(
+        "SELECT d.address AS bssid, d.meta AS meta, s.rssi_last AS rssi "
+        "FROM sessions s JOIN devices d ON d.id = s.device_id "
+        "WHERE d.kind = 'wifi_ap' AND s.ended_at IS NULL "
+        "AND ? - s.last_sight <= ?", (now, gap)).fetchall()
+    out = []
+    for r in rows:
+        try:
+            meta = json.loads(r["meta"]) if r["meta"] else {}
+        except (ValueError, TypeError):
+            meta = {}
+        out.append({"bssid": r["bssid"], "ssid": meta.get("ssid"),
+                    "enc": meta.get("enc"), "rssi": r["rssi"]})
+    return out
+
+
+# --- known-networks file (wpa_supplicant-native, §12) ---------------------
+
+def parse_networks_conf(path):
+    """Parse wpa_supplicant `network={}` blocks -> [{ssid, psk, key_mgmt, priority}]."""
+    nets = []
+    cur = None
+    try:
+        with open(path) as f:
+            text = f.read()
+    except FileNotFoundError:
+        return nets
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("network=") and "{" in line:
+            cur = {"ssid": None, "psk": None, "key_mgmt": None, "priority": 0}
+            continue
+        if cur is None:
+            continue
+        if line.startswith("}"):
+            if cur.get("ssid"):
+                nets.append(cur)
+            cur = None
+            continue
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip()
+        if key == "ssid":
+            cur["ssid"] = val.strip('"')
+        elif key == "psk":
+            cur["psk"] = val.strip('"')   # quoted passphrase or 64-hex PSK
+        elif key == "key_mgmt":
+            cur["key_mgmt"] = val
+        elif key == "priority":
+            try:
+                cur["priority"] = int(val)
+            except ValueError:
+                pass
+    return nets
+
+
+def select_candidates(visible, known, allow_open):
+    """Order APs to try: known PSK first (by priority/rssi), then open by rssi.
+
+    Phase 6 will additionally filter by net_health.cooldown_until and rank open
+    networks by reputation; here we only intersect "visible now" with config.
+    """
+    by_ssid = {n["ssid"]: n for n in known if n.get("ssid")}
+    known_psk, known_open, disc_open = [], [], []
+    seen_ssids = set()
+
+    def rssi_key(c):
+        return c["rssi"] if c["rssi"] is not None else -999
+
+    for ap in visible:
+        ssid = ap.get("ssid")
+        if not ssid:
+            continue
+        kn = by_ssid.get(ssid)
+        if kn is not None:
+            if ssid in seen_ssids:
+                continue            # one attempt per known SSID (assoc by SSID)
+            seen_ssids.add(ssid)
+            is_open = (kn.get("key_mgmt") == "NONE") or not kn.get("psk")
+            cand = {"ssid": ssid, "bssid": ap["bssid"], "psk": kn.get("psk"),
+                    "is_open": is_open, "priority": kn.get("priority", 0),
+                    "rssi": ap["rssi"]}
+            (known_open if is_open else known_psk).append(cand)
+        elif allow_open and ap.get("enc") == "open":
+            disc_open.append({"ssid": ssid, "bssid": ap["bssid"], "psk": None,
+                              "is_open": True, "priority": 0, "rssi": ap["rssi"]})
+
+    known_psk.sort(key=lambda c: (c["priority"], rssi_key(c)), reverse=True)
+    known_open.sort(key=lambda c: (c["priority"], rssi_key(c)), reverse=True)
+    disc_open.sort(key=rssi_key, reverse=True)
+    return known_psk + known_open + disc_open
+
+
+# --- wpa_supplicant association -------------------------------------------
+
+def wpa_conf_path(iface):
+    return f"/etc/wpa_supplicant/wpa_supplicant-{iface}.conf"
+
+
+def write_transient_conf(iface, cand):
+    """Single-network wpa_supplicant conf for one candidate (secret, 0600)."""
+    if cand["is_open"]:
+        netblock = '    key_mgmt=NONE\n'
+    else:
+        psk = cand["psk"] or ""
+        if re.fullmatch(r"[0-9a-fA-F]{64}", psk):
+            netblock = f'    psk={psk}\n'          # pre-hashed PSK, no quotes
+        else:
+            netblock = f'    psk="{psk}"\n'        # passphrase
+    body = ("ctrl_interface=/run/wpa_supplicant\n"
+            "update_config=1\n"
+            "network={\n"
+            f'    ssid="{cand["ssid"]}"\n'
+            f"{netblock}"
+            "}\n")
+    path = wpa_conf_path(iface)
+    # Write 0600 from the start so the PSK is never briefly world-readable.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(body)
+
+
+def wpa_state(iface):
+    _, out = run(["wpa_cli", "-i", iface, "status"], timeout=10)
+    m = re.search(r"^wpa_state=(\S+)", out, re.M)
+    return m.group(1) if m else None
+
+
+def have_ipv4(iface):
+    _, out = run(["ip", "-4", "addr", "show", "dev", iface], timeout=10)
+    return "inet " in out
+
+
+def associate(iface, cand, timeout):
+    """Bring wlan0 onto one candidate. Returns (ok, reason)."""
+    write_transient_conf(iface, cand)
+    run(["systemctl", "restart", f"wpa_supplicant@{iface}"], timeout=30)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if wpa_state(iface) == "COMPLETED":
+            break
+        time.sleep(1)
+    else:
+        return False, "assoc"
+    # networkd runs DHCP via the shipped 80-gewgaw-wlan0.network; await an IP.
+    while time.monotonic() < deadline:
+        if have_ipv4(iface):
+            return True, None
+        time.sleep(1)
+    return False, "dhcp"
+
+
+def connectivity_reason(url, timeout):
+    """204 => (True, None); else (False, 'captive'|'no_internet')."""
+    _, out = run(["wget", "-S", "-O", "/dev/null", "-T", str(timeout), url],
+                 timeout=timeout + 10, combine=True)
+    m = re.search(r"HTTP/\S+\s+(\d{3})", out)
+    if not m:
+        return False, "no_internet"          # DNS/timeout/no route
+    code = int(m.group(1))
+    if code == 204:
+        return True, None
+    return False, "captive" if code in (200, 301, 302, 303, 307, 308) \
+        else "no_internet"
+
+
+def teardown(iface):
+    """Idempotent: drop the link and remove the transient secret."""
+    run(["systemctl", "stop", f"wpa_supplicant@{iface}"], timeout=30)
+    run(["ip", "addr", "flush", "dev", iface], timeout=10)
+    try:
+        os.unlink(wpa_conf_path(iface))
+    except FileNotFoundError:
+        pass
+
+
+# --- radio lease (arbiter client, §6) -------------------------------------
+
+class RadioLease:
+    """Acquire the collector's radio lease for the duration of a `with` block.
+
+    If the arbiter socket is absent (collector not running) we proceed without a
+    lease — there is then no scanner to contend with. A connected-but-refused
+    grant raises, so we never retune the radio behind an active scan.
+    """
+
+    def __init__(self, sock_path, seconds):
+        self.sock_path = sock_path
+        self.seconds = seconds
+        self.sock = None
+
+    def __enter__(self):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(self.seconds + 30)
+            s.connect(self.sock_path)
+        except OSError as e:
+            log(f"arbiter unavailable ({e}); proceeding without a radio lease")
+            return self
+        f = s.makefile("rwb", buffering=0)
+        f.write(f"ACQUIRE {self.seconds}\n".encode())
+        reply = f.readline().decode().strip()
+        if reply != "GRANTED":
+            s.close()
+            raise RuntimeError(f"arbiter refused lease: {reply!r}")
+        self.sock = s
+        self._f = f
+        log(f"radio lease granted ({self.seconds}s)")
+        return self
+
+    def __exit__(self, *exc):
+        if self.sock is not None:
+            try:
+                self._f.write(b"RELEASE\n")
+                self._f.readline()
+            except OSError:
+                pass
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            log("radio lease released")
+        return False
+
+
+# --- upload (§10) ---------------------------------------------------------
+
+def session_payload(row):
+    try:
+        meta = json.loads(row["meta"]) if row["meta"] else {}
+    except (ValueError, TypeError):
+        meta = {}
+    obj = {
+        "kind": row["kind"],
+        "address": row["address"],
+        "started_at": row["started_at"],
+        "ended_at": row["ended_at"],
+        "sighting_count": row["sighting_count"],
+        "rssi_min": row["rssi_min"],
+        "rssi_max": row["rssi_max"],
+        "rssi_last": row["rssi_last"],
+    }
+    if row["kind"] == "wifi_ap":
+        obj["ssid"] = meta.get("ssid")
+        obj["channel"] = meta.get("channel")
+        obj["enc"] = meta.get("enc")
+    else:
+        obj["name"] = meta.get("ble_name")
+    return obj
+
+
+def flush_sightings(conn, base_topic, batch):
+    """Upload closed, unsynced sessions in chunks; mark synced after each pub."""
+    rows = conn.execute(
+        "SELECT s.id AS id, d.kind AS kind, d.address AS address, "
+        "d.meta AS meta, s.started_at, s.ended_at, s.sighting_count, "
+        "s.rssi_min, s.rssi_max, s.rssi_last "
+        "FROM sessions s JOIN devices d ON d.id = s.device_id "
+        "WHERE s.ended_at IS NOT NULL AND s.synced = 0 "
+        "ORDER BY s.id").fetchall()
+    topic = f"{base_topic}/sightings"
+    uploaded = 0
+    for i in range(0, len(rows), batch):
+        chunk = rows[i:i + batch]
+        payload = json.dumps([session_payload(r) for r in chunk])
+        rc, _ = run(["aws-iot-mqtt", "pub", topic, payload], timeout=60)
+        if rc != 0:
+            log(f"pub to {topic} failed (rc={rc}); leaving "
+                f"{len(rows) - uploaded} session(s) for next run")
+            break
+        ids = [r["id"] for r in chunk]
+        conn.execute(
+            f"UPDATE sessions SET synced = 1 WHERE id IN "
+            f"({','.join('?' * len(ids))})", ids)
+        conn.commit()
+        uploaded += len(chunk)
+        log(f"uploaded {len(chunk)} session(s) to {topic}")
+    return uploaded
+
+
+# --- modes ----------------------------------------------------------------
+
+def upload_run(cfg):
+    iface = cfg["WIFI_IFACE"]
+    conn = connect_db(cfg["GEWGAW_DB"])
+    try:
+        pending = count_pending(conn)
+        if pending == 0:
+            log("nothing to upload (no closed unsynced sessions)")
+            return 0
+        log(f"{pending} closed session(s) pending upload")
+
+        base = read_topic_base(AWS_CONF)
+        if not base:
+            log(f"could not derive topic base from {AWS_CONF}; aborting")
+            return 1
+
+        now = int(time.time())
+        gap = int(cfg["SESSION_GAP"])
+        cands = select_candidates(
+            visible_aps(conn, gap, now),
+            parse_networks_conf(cfg["KNOWN_NETWORKS"]),
+            cfg["ALLOW_OPEN"] == "1")
+        if not cands:
+            log("no usable AP visible right now; will retry next run")
+            return 0
+        log(f"{len(cands)} candidate AP(s); trying up to {cfg['MAX_ATTEMPTS']}")
+
+        max_attempts = int(cfg["MAX_ATTEMPTS"])
+        connect_timeout = int(cfg["CONNECT_TIMEOUT"])
+        url = cfg["HTTP_CHECK_URL"]
+        batch = int(cfg["SUBMIT_BATCH"])
+        uploaded = 0
+
+        with RadioLease(cfg["GEWGAW_SOCK"], int(cfg["LEASE_SECONDS"])):
+            try:
+                for cand in cands[:max_attempts]:
+                    tag = f"{cand['ssid']} ({cand['bssid']}, " \
+                          f"{'open' if cand['is_open'] else 'psk'})"
+                    log(f"trying {tag}")
+                    ok, reason = associate(iface, cand, connect_timeout)
+                    if not ok:
+                        log(f"  association failed: {reason}")
+                        teardown(iface)
+                        continue            # Phase 6: net_health fail update
+                    cok, creason = connectivity_reason(url, 15)
+                    if not cok:
+                        log(f"  no internet: {creason}")
+                        teardown(iface)
+                        continue            # Phase 6: net_health fail update
+                    log(f"  online via {tag}")
+                    # Phase 5: flush unsynced `events` (boot beacons) first (§10).
+                    uploaded = flush_sightings(conn, base, batch)
+                    break                   # Phase 6: net_health success update
+            finally:
+                teardown(iface)
+
+        log(f"done; uploaded {uploaded} session(s)")
+        return 0
+    finally:
+        conn.close()
+
+
+def boot_run(cfg):
+    # PHASE 5 (§8.1): record the boot event first, get online with a bigger
+    # budget, confirm NTP, then flush events + sightings. Still a stub.
+    log("boot mode is PHASE 5 (boot beacon + events) — not implemented yet")
+    return 0
 
 
 def main():
+    cfg = load_conf(CONF)
     mode = sys.argv[1] if len(sys.argv) > 1 else "upload"
-    if mode not in ("upload", "boot"):
-        print(f"gewgaw-submit: unknown mode '{mode}' (use upload|boot)",
-              file=sys.stderr)
-        return 2
-    print(f"gewgaw-submit: PHASE 1 STUB — mode={mode}; nothing to do yet.",
-          flush=True)
-    return 0
+    if mode == "upload":
+        return upload_run(cfg)
+    if mode == "boot":
+        return boot_run(cfg)
+    log(f"unknown mode '{mode}' (use upload|boot)")
+    return 2
 
 
 if __name__ == "__main__":

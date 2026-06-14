@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""gewgaw-collector — Wi-Fi AP + BLE presence collector (phase 2).
+"""gewgaw-collector — Wi-Fi AP + BLE presence collector + radio arbiter (phase 3).
 
 Long-running daemon. Every SCAN_INTERVAL it:
-  1. scans 2.4 GHz Wi-Fi APs via `iw dev <iface> scan`,
+  1. scans 2.4 GHz Wi-Fi APs via `iw dev <iface> scan` (unless the radio is
+     currently leased out to the submit daemon — see the arbiter below),
   2. runs a BLE discovery window via `bluetoothctl` and keeps the devices that
      are in range *now* (RSSI present in `bluetoothctl info`),
   3. folds every observation into the SQLite presence model (devices + sessions),
@@ -14,15 +15,21 @@ interval it was visible. A device present continuously is ONE growing session;
 disappearing past SESSION_GAP and returning opens a SECOND session. That gives a
 "seen / gone / back / gone" timeline without a row per scan.
 
-Phase boundaries: the radio arbiter (design §6) and the submit/upload path are
-later phases — this daemon only scans and records. Because there is no arbiter
-yet, Wi-Fi scanning runs every cycle unconditionally; once the arbiter lands it
-will gate the Wi-Fi scan while submit holds the radio (BLE keeps running).
+Radio arbiter (design §6): the Pi 3 has a single 2.4 GHz radio, so the collector
+cannot scan while the submit daemon is associated to an AP for an upload. The
+collector therefore hosts a unix-socket arbiter at GEWGAW_SOCK. A client (submit)
+sends `ACQUIRE <seconds>`; the collector finishes any in-flight Wi-Fi scan, stops
+scanning Wi-Fi, and replies `GRANTED`. `RELEASE` resumes scanning (`OK`); `PING`
+returns `PONG <state>`. The lease is bound to the client connection: if the
+client never RELEASEs within its lease, drops the connection, or crashes, the
+collector auto-resumes — no deadlock. BLE keeps scanning throughout (independent
+side of the combo chip).
 """
 import json
 import os
 import re
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -41,6 +48,13 @@ DEFAULTS = {
     "BLE_SCAN_SECONDS": "10",
     "SESSION_GAP": "300",
 }
+
+# Lease bounds for the radio arbiter. A client requests a duration in ACQUIRE;
+# we clamp it so a buggy/lost client can never wedge Wi-Fi scanning forever (the
+# connection watchdog also covers crashes). The boot run asks for the most
+# (BOOT_LEASE_SECONDS=360 in the design), so the cap sits comfortably above it.
+ARBITER_DEFAULT_LEASE = 180
+ARBITER_MAX_LEASE = 600
 
 _stop = threading.Event()
 
@@ -75,6 +89,172 @@ def run(cmd, timeout=30):
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         log(f"command failed: {' '.join(cmd)}: {e}")
         return ""
+
+
+# --- radio arbiter (design §6) --------------------------------------------
+
+class RadioArbiter:
+    """Single-radio mutex between the collector's Wi-Fi scan and the submit
+    daemon, exposed as a unix-socket line server.
+
+    Concurrency model: one lease per client connection. The collector's scan
+    loop calls begin_wifi_scan()/end_wifi_scan() around each `iw` scan; a lease
+    holder blocks new scans and (on ACQUIRE) waits for any in-flight scan to
+    drain before GRANTED, so the radio is genuinely quiesced before submit
+    retunes it. The lease ends on RELEASE, on the socket's lease timeout, or
+    when the connection drops — whichever comes first.
+    """
+
+    def __init__(self, sock_path):
+        self.sock_path = sock_path
+        self._cond = threading.Condition()
+        self._held = False          # radio leased to a client
+        self._scan_active = False   # a collector Wi-Fi scan is in progress
+        self._holder = None         # debug label of the current lease
+        self._server = None
+        self._thread = None
+
+    # -- collector side ----------------------------------------------------
+    def begin_wifi_scan(self):
+        """Reserve the radio for a Wi-Fi scan. False => leased out, skip Wi-Fi."""
+        with self._cond:
+            if self._held:
+                return False
+            self._scan_active = True
+            return True
+
+    def end_wifi_scan(self):
+        with self._cond:
+            self._scan_active = False
+            self._cond.notify_all()
+
+    @property
+    def held(self):
+        with self._cond:
+            return self._held
+
+    def _state(self):
+        with self._cond:
+            if self._held:
+                return "held"
+            return "scanning" if self._scan_active else "idle"
+
+    # -- lease lifecycle ---------------------------------------------------
+    def _acquire(self, holder):
+        """Take the lease, then wait for any in-flight scan to finish."""
+        with self._cond:
+            self._held = True
+            self._holder = holder
+            while self._scan_active:
+                self._cond.wait(timeout=1.0)
+
+    def _release(self):
+        with self._cond:
+            self._held = False
+            self._holder = None
+
+    # -- socket server -----------------------------------------------------
+    def start(self):
+        try:
+            os.unlink(self.sock_path)
+        except FileNotFoundError:
+            pass
+        os.makedirs(os.path.dirname(self.sock_path), exist_ok=True)
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(self.sock_path)
+        os.chmod(self.sock_path, 0o660)
+        srv.listen(4)
+        srv.settimeout(1.0)         # wake periodically to honour _stop
+        self._server = srv
+        self._thread = threading.Thread(target=self._serve, name="arbiter",
+                                         daemon=True)
+        self._thread.start()
+        log(f"arbiter: listening on {self.sock_path}")
+
+    def stop(self):
+        if self._server is not None:
+            try:
+                self._server.close()
+            except OSError:
+                pass
+        try:
+            os.unlink(self.sock_path)
+        except FileNotFoundError:
+            pass
+
+    def _serve(self):
+        while not _stop.is_set():
+            try:
+                conn, _ = self._server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._handle, args=(conn,),
+                             daemon=True).start()
+
+    def _handle(self, conn):
+        holding = False
+        f = None
+        try:
+            conn.settimeout(10.0)               # command must arrive promptly
+            f = conn.makefile("rwb", buffering=0)
+            line = f.readline()
+            if not line:
+                return
+            parts = line.split()
+            cmd = parts[0].upper() if parts else b""
+
+            if cmd == b"PING":
+                f.write(("PONG " + self._state() + "\n").encode())
+                return
+            if cmd == b"RELEASE":
+                # No active lease on this connection — nothing held, ack anyway.
+                f.write(b"OK\n")
+                return
+            if cmd != b"ACQUIRE":
+                f.write(b"ERR unknown command\n")
+                return
+
+            try:
+                secs = int(parts[1])
+            except (IndexError, ValueError):
+                secs = ARBITER_DEFAULT_LEASE
+            secs = max(1, min(secs, ARBITER_MAX_LEASE))
+
+            self._acquire(holder=f"lease {secs}s")
+            holding = True
+            f.write(b"GRANTED\n")
+            log(f"arbiter: granted radio for up to {secs}s")
+
+            # Hold until RELEASE, lease timeout, or the client disconnects.
+            conn.settimeout(secs)
+            try:
+                rel = f.readline()
+                if rel and rel.split()[0:1] == [b"RELEASE"]:
+                    log("arbiter: released by client")
+                else:
+                    log("arbiter: client disconnected; auto-resuming")
+            except socket.timeout:
+                log(f"arbiter: lease expired after {secs}s; auto-resuming")
+        except OSError:
+            pass
+        finally:
+            if holding:
+                self._release()
+                try:
+                    f.write(b"OK\n")
+                except OSError:
+                    pass
+            if f is not None:
+                try:
+                    f.close()
+                except OSError:
+                    pass
+            try:
+                conn.close()
+            except OSError:
+                pass
 
 
 # --- database -------------------------------------------------------------
@@ -336,6 +516,9 @@ def main():
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
+    arbiter = RadioArbiter(cfg["GEWGAW_SOCK"])
+    arbiter.start()
+
     ensure_iface_up(iface)
     ensure_bt_powered()
     log(f"started; db={db_path} iface={iface} interval={scan_interval}s "
@@ -345,12 +528,21 @@ def main():
         cycle = time.monotonic()
         synced = clock_is_synced()
 
-        # Phase 3: the arbiter will gate this Wi-Fi scan while submit holds the
-        # radio. For now it always runs.
-        wifi = scan_wifi(iface)
-        now = int(time.time())
-        for o in wifi:
-            record_observation(conn, o, now, gap, synced)
+        # Wi-Fi shares the single radio with the submit daemon: only scan when
+        # the arbiter grants it. begin/end bracket the scan so an ACQUIRE during
+        # a scan waits for it to drain before the radio is handed over.
+        if arbiter.begin_wifi_scan():
+            try:
+                wifi = scan_wifi(iface)
+            finally:
+                arbiter.end_wifi_scan()
+            now = int(time.time())
+            for o in wifi:
+                record_observation(conn, o, now, gap, synced)
+            wifi_n = len(wifi)
+            wifi_note = f"{wifi_n} wifi AP(s)"
+        else:
+            wifi_note = "wifi skipped (radio leased)"
 
         # BLE is the independent side of the combo chip — always safe to scan.
         ble = scan_ble(ble_seconds)
@@ -360,12 +552,13 @@ def main():
 
         reap_sessions(conn, int(time.time()), gap)
         conn.commit()
-        log(f"cycle: {len(wifi)} wifi AP(s), {len(ble)} BLE device(s) "
+        log(f"cycle: {wifi_note}, {len(ble)} BLE device(s) "
             f"(clock_synced={synced})")
 
         slept = time.monotonic() - cycle
         _stop.wait(max(0, scan_interval - slept))
 
+    arbiter.stop()
     conn.close()
     log("stopped")
     return 0
