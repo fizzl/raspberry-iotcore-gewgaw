@@ -7,8 +7,9 @@ NOTE: the collector does real Wi-Fi + BLE scanning into the SQLite presence \
 model (phase 2) and hosts the single-radio arbiter at GEWGAW_SOCK (phase 3); \
 gewgaw-submit does the real steady-state upload (candidate selection, \
 wpa_supplicant association, 204 connectivity check, batched publish via \
-aws-iot-mqtt) (phase 4). Its boot-beacon mode and the net_health blacklist are \
-later phases."
+aws-iot-mqtt) (phase 4) and the boot beacon (record a boot event, get online \
+with a larger budget, confirm NTP, flush events to .../status then sightings) \
+(phase 5). The per-BSSID net_health blacklist is a later phase."
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 

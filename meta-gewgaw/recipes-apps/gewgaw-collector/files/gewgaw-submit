@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""gewgaw-submit — opportunistic uploader (phase 4: steady-state upload mode).
+"""gewgaw-submit — opportunistic uploader (phases 4+5).
 
 Modes (see scan_and_submit_daemons_design.md §8):
   gewgaw-submit          steady-state upload run (hourly timer)
-  gewgaw-submit boot     boot phase / first-connect beacon  [PHASE 5 — still stub]
+  gewgaw-submit boot     boot phase / first-connect beacon (§8.1)
 
-Steady-state run (this phase):
-  1. Count closed, unsynced sessions; nothing queued => exit.
+Steady-state run:
+  1. Count closed unsynced sessions + unsynced events; nothing queued => exit.
   2. Candidate selection: APs the collector can see *now* (its open `wifi_ap`
      sessions, last sighting within SESSION_GAP) that are either a configured
      known network (PSK) or, with ALLOW_OPEN, open.
@@ -15,13 +15,19 @@ Steady-state run (this phase):
   4. For each candidate (capped at MAX_ATTEMPTS): write a transient single-network
      wpa_supplicant conf, (re)start wpa_supplicant@<iface>, wait for association
      + an IPv4 lease, then a 204 connectivity check. First good link wins.
-  5. On internet: upload closed unsynced sessions in batches via `aws-iot-mqtt
-     pub` to gewgaw/<thing>/sightings; mark rows synced only after pub exits 0.
+  5. On internet: flush unsynced `events` to gewgaw/<thing>/status, then closed
+     unsynced sessions to gewgaw/<thing>/sightings, batched via `aws-iot-mqtt
+     pub`; mark rows synced only after each pub exits 0.
   6. Teardown (stop supplicant, flush wlan0, delete transient conf) + RELEASE.
 
-Later phases (hooks marked inline): per-BSSID net_health blacklist (§9), the
-events/boot-beacon flush to gewgaw/<thing>/status (§5.4/§8.1), and multi-network
-priority/reputation polish.
+Boot run (§8.1): record a `boot` event *first* (delivery decoupled, so a boot
+with no uplink is still reported later with its real time), wait up to
+WAIT_FOR_SCAN for the collector's first scan, then connect with a larger lease
+and a BOOT_CONNECT_BUDGET retry budget, confirm NTPSynchronized, re-stamp the
+boot event with the corrected clock + link info, and flush events + sightings.
+
+Later phase (hooks marked inline): per-BSSID net_health blacklist (§9) and
+multi-network priority/reputation polish.
 """
 import json
 import os
@@ -48,6 +54,11 @@ DEFAULTS = {
     "CONNECT_TIMEOUT": "45",
     "HTTP_CHECK_URL": "http://connectivitycheck.gstatic.com/generate_204",
     "SUBMIT_BATCH": "200",
+    # boot phase (§8.1)
+    "WAIT_FOR_SCAN": "60",
+    "BOOT_CONNECT_BUDGET": "300",
+    "BOOT_LEASE_SECONDS": "450",
+    "NTP_WAIT": "90",
 }
 
 
@@ -114,6 +125,11 @@ def count_pending(conn):
     return conn.execute(
         "SELECT COUNT(*) FROM sessions WHERE ended_at IS NOT NULL "
         "AND synced = 0").fetchone()[0]
+
+
+def count_pending_events(conn):
+    return conn.execute(
+        "SELECT COUNT(*) FROM events WHERE synced = 0").fetchone()[0]
 
 
 def visible_aps(conn, gap, now):
@@ -238,6 +254,9 @@ def write_transient_conf(iface, cand):
             f"{netblock}"
             "}\n")
     path = wpa_conf_path(iface)
+    # The dir may not exist on a clean flash (only setup-wlan.sh would have made
+    # it); create it before writing so opportunistic mode works without dev mode.
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     # Write 0600 from the start so the PSK is never briefly world-readable.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -253,6 +272,12 @@ def wpa_state(iface):
 def have_ipv4(iface):
     _, out = run(["ip", "-4", "addr", "show", "dev", iface], timeout=10)
     return "inet " in out
+
+
+def current_ipv4(iface):
+    _, out = run(["ip", "-4", "-o", "addr", "show", "dev", iface], timeout=10)
+    m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", out)
+    return m.group(1) if m else None
 
 
 def associate(iface, cand, timeout):
@@ -296,6 +321,48 @@ def teardown(iface):
         os.unlink(wpa_conf_path(iface))
     except FileNotFoundError:
         pass
+
+
+def connect_any(iface, cands, connect_timeout, url, deadline=None,
+                max_attempts=None):
+    """Try candidates until one yields real internet; return the winner or None.
+
+    Two stop policies (shared by both modes):
+      * steady-state (§8): a single pass capped at `max_attempts`.
+      * boot (§8.1): keep cycling the list until monotonic `deadline`, pausing
+        between sweeps so a momentarily-out-of-range AP can be retried.
+    Phase 6 hook: per-BSSID net_health updates on each failure/success.
+    """
+    if not cands:
+        return None
+    attempt = 0
+    while True:
+        for cand in cands:
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            if max_attempts is not None and attempt >= max_attempts:
+                return None
+            attempt += 1
+            tag = (f"{cand['ssid']} ({cand['bssid']}, "
+                   f"{'open' if cand['is_open'] else 'psk'})")
+            log(f"trying {tag} [attempt {attempt}]")
+            ok, reason = associate(iface, cand, connect_timeout)
+            if not ok:
+                log(f"  association failed: {reason}")
+                teardown(iface)
+                continue            # Phase 6: net_health fail update
+            cok, creason = connectivity_reason(url, 15)
+            if not cok:
+                log(f"  no internet: {creason}")
+                teardown(iface)
+                continue            # Phase 6: net_health fail update
+            log(f"  online via {tag}")
+            return cand             # Phase 6: net_health success update
+        if deadline is None:
+            return None             # steady-state: one pass only
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(5)              # boot budget remains; re-sweep the list
 
 
 # --- radio lease (arbiter client, §6) -------------------------------------
@@ -402,17 +469,147 @@ def flush_sightings(conn, base_topic, batch):
     return uploaded
 
 
+# --- events / boot beacon (§5.4, §8.1) ------------------------------------
+
+def event_payload(row):
+    """Reconstruct an event's JSON for upload (stored payload + type/ts/flag)."""
+    try:
+        detail = json.loads(row["payload"]) if row["payload"] else {}
+    except (ValueError, TypeError):
+        detail = {}
+    detail.setdefault("ts", row["ts"])
+    detail.setdefault("clock_synced", row["clock_synced"])
+    detail["type"] = row["type"]
+    return detail
+
+
+def flush_events(conn, base_topic, batch):
+    """Upload unsynced events to <base>/status; mark synced after each pub."""
+    rows = conn.execute(
+        "SELECT id, ts, type, clock_synced, payload FROM events "
+        "WHERE synced = 0 ORDER BY id").fetchall()
+    if not rows:
+        return 0
+    topic = f"{base_topic}/status"
+    uploaded = 0
+    for i in range(0, len(rows), batch):
+        chunk = rows[i:i + batch]
+        payload = json.dumps([event_payload(r) for r in chunk])
+        rc, _ = run(["aws-iot-mqtt", "pub", topic, payload], timeout=60)
+        if rc != 0:
+            log(f"pub to {topic} failed (rc={rc}); leaving "
+                f"{len(rows) - uploaded} event(s) for next run")
+            break
+        ids = [r["id"] for r in chunk]
+        conn.execute(
+            f"UPDATE events SET synced = 1 WHERE id IN "
+            f"({','.join('?' * len(ids))})", ids)
+        conn.commit()
+        uploaded += len(chunk)
+        log(f"uploaded {len(chunk)} event(s) to {topic}")
+    return uploaded
+
+
+def ntp_synced():
+    """True if systemd reports the clock is NTP-synchronized."""
+    _, out = run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+                 timeout=10)
+    val = out.strip().lower()
+    if val in ("yes", "no"):
+        return val == "yes"
+    return "ntpsynchronized=yes" in out.strip().lower()  # older timedatectl
+
+
+def wait_ntp(timeout):
+    """Poll for NTPSynchronized=yes up to `timeout` seconds (>=1 probe)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if ntp_synced():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(2)
+
+
+def _read_os_release():
+    data = {}
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                data[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return data
+
+
+def _image_version():
+    d = _read_os_release()
+    return d.get("BUILD_ID") or d.get("VERSION_ID") or d.get("VERSION")
+
+
+def _uptime_seconds():
+    try:
+        with open("/proc/uptime") as f:
+            return int(float(f.read().split()[0]))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _rootfs_free():
+    try:
+        st = os.statvfs("/")
+        return st.f_bavail * st.f_frsize
+    except OSError:
+        return None
+
+
+def boot_payload(conn, synced, ip=None, ssid=None):
+    """Boot beacon payload (§8.1 / decision Q7)."""
+    return {
+        "ts": int(time.time()),
+        "clock_synced": 1 if synced else 0,
+        "uptime": _uptime_seconds(),
+        "ip": ip,
+        "ssid": ssid,
+        "image_version": _image_version(),
+        "kernel": os.uname().release,
+        "pending_sightings": count_pending(conn),
+        "disk_free": _rootfs_free(),
+    }
+
+
+def record_event(conn, etype, payload, synced):
+    cur = conn.execute(
+        "INSERT INTO events (ts, type, clock_synced, payload, synced) "
+        "VALUES (?, ?, ?, ?, 0)",
+        (payload["ts"], etype, 1 if synced else 0, json.dumps(payload)))
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_event(conn, event_id, payload, synced):
+    conn.execute(
+        "UPDATE events SET ts = ?, clock_synced = ?, payload = ? WHERE id = ?",
+        (payload["ts"], 1 if synced else 0, json.dumps(payload), event_id))
+    conn.commit()
+
+
 # --- modes ----------------------------------------------------------------
 
 def upload_run(cfg):
     iface = cfg["WIFI_IFACE"]
     conn = connect_db(cfg["GEWGAW_DB"])
     try:
-        pending = count_pending(conn)
-        if pending == 0:
-            log("nothing to upload (no closed unsynced sessions)")
+        pending_s = count_pending(conn)
+        pending_e = count_pending_events(conn)
+        if pending_s == 0 and pending_e == 0:
+            log("nothing to upload (no closed unsynced sessions or events)")
             return 0
-        log(f"{pending} closed session(s) pending upload")
+        log(f"{pending_s} session(s) + {pending_e} event(s) pending upload")
 
         base = read_topic_base(AWS_CONF)
         if not base:
@@ -430,46 +627,93 @@ def upload_run(cfg):
             return 0
         log(f"{len(cands)} candidate AP(s); trying up to {cfg['MAX_ATTEMPTS']}")
 
-        max_attempts = int(cfg["MAX_ATTEMPTS"])
-        connect_timeout = int(cfg["CONNECT_TIMEOUT"])
-        url = cfg["HTTP_CHECK_URL"]
         batch = int(cfg["SUBMIT_BATCH"])
-        uploaded = 0
-
         with RadioLease(cfg["GEWGAW_SOCK"], int(cfg["LEASE_SECONDS"])):
             try:
-                for cand in cands[:max_attempts]:
-                    tag = f"{cand['ssid']} ({cand['bssid']}, " \
-                          f"{'open' if cand['is_open'] else 'psk'})"
-                    log(f"trying {tag}")
-                    ok, reason = associate(iface, cand, connect_timeout)
-                    if not ok:
-                        log(f"  association failed: {reason}")
-                        teardown(iface)
-                        continue            # Phase 6: net_health fail update
-                    cok, creason = connectivity_reason(url, 15)
-                    if not cok:
-                        log(f"  no internet: {creason}")
-                        teardown(iface)
-                        continue            # Phase 6: net_health fail update
-                    log(f"  online via {tag}")
-                    # Phase 5: flush unsynced `events` (boot beacons) first (§10).
-                    uploaded = flush_sightings(conn, base, batch)
-                    break                   # Phase 6: net_health success update
+                winner = connect_any(
+                    iface, cands, int(cfg["CONNECT_TIMEOUT"]),
+                    cfg["HTTP_CHECK_URL"], max_attempts=int(cfg["MAX_ATTEMPTS"]))
+                if winner is not None:
+                    # §10: flush events (boot beacons) first, then sightings.
+                    flush_events(conn, base, batch)
+                    flush_sightings(conn, base, batch)
             finally:
                 teardown(iface)
-
-        log(f"done; uploaded {uploaded} session(s)")
         return 0
     finally:
         conn.close()
 
 
 def boot_run(cfg):
-    # PHASE 5 (§8.1): record the boot event first, get online with a bigger
-    # budget, confirm NTP, then flush events + sightings. Still a stub.
-    log("boot mode is PHASE 5 (boot beacon + events) — not implemented yet")
-    return 0
+    """Boot phase / first-connect beacon (§8.1)."""
+    iface = cfg["WIFI_IFACE"]
+    conn = connect_db(cfg["GEWGAW_DB"])
+    try:
+        base = read_topic_base(AWS_CONF)
+
+        # 1. Record the boot intent FIRST so it survives a failed uplink (§5.4).
+        synced = ntp_synced()
+        payload = boot_payload(conn, synced)
+        event_id = record_event(conn, "boot", payload, synced)
+        log(f"recorded boot event #{event_id} "
+            f"(clock_synced={int(synced)}, "
+            f"pending_sightings={payload['pending_sightings']})")
+
+        if not base:
+            log(f"could not derive topic base from {AWS_CONF}; "
+                "boot event queued for a later run")
+            return 0
+
+        # 2. The collector just started; wait for its first scan to surface a
+        #    usable candidate (poll the DB up to WAIT_FOR_SCAN).
+        gap = int(cfg["SESSION_GAP"])
+        allow_open = cfg["ALLOW_OPEN"] == "1"
+        known = parse_networks_conf(cfg["KNOWN_NETWORKS"])
+        wait_deadline = time.monotonic() + int(cfg["WAIT_FOR_SCAN"])
+        cands = []
+        while True:
+            cands = select_candidates(
+                visible_aps(conn, gap, int(time.time())), known, allow_open)
+            if cands or time.monotonic() >= wait_deadline:
+                break
+            time.sleep(3)
+        if not cands:
+            log(f"no candidate AP within {cfg['WAIT_FOR_SCAN']}s; "
+                "boot event stays queued for the next run")
+            return 0
+        log(f"{len(cands)} candidate AP(s) at boot")
+
+        # 3+4. Larger lease + a time budget more forgiving than a steady run.
+        batch = int(cfg["SUBMIT_BATCH"])
+        with RadioLease(cfg["GEWGAW_SOCK"], int(cfg["BOOT_LEASE_SECONDS"])):
+            try:
+                budget = int(cfg["BOOT_CONNECT_BUDGET"])
+                winner = connect_any(
+                    iface, cands, int(cfg["CONNECT_TIMEOUT"]),
+                    cfg["HTTP_CHECK_URL"],
+                    deadline=time.monotonic() + budget)
+                if winner is None:
+                    log(f"could not get online within {budget}s; "
+                        "boot event stays queued for the next run")
+                    return 0
+
+                # 5. Confirm NTP, then re-stamp the boot event with the
+                #    corrected clock and the actual link details.
+                synced = wait_ntp(int(cfg["NTP_WAIT"]))
+                ip = current_ipv4(iface)
+                payload = boot_payload(conn, synced, ip=ip, ssid=winner["ssid"])
+                update_event(conn, event_id, payload, synced)
+                log(f"boot event re-stamped (clock_synced={int(synced)}, "
+                    f"ip={ip}, ssid={winner['ssid']})")
+
+                # 6. Flush events (the boot beacon) first, then sightings (§10).
+                flush_events(conn, base, batch)
+                flush_sightings(conn, base, batch)
+            finally:
+                teardown(iface)
+        return 0
+    finally:
+        conn.close()
 
 
 def main():
