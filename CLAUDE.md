@@ -72,6 +72,20 @@ There is no test suite; iteration means re-running `build.sh` and booting the im
   runtime-only: nothing baked into the image, no Wi-Fi secret committed, re-run after each
   flash. Both host scripts use reflash-tolerant SSH opts (no host-key checking).
 
+- **Two mutually-exclusive wlan0 modes.** `setup-wlan.sh` is **dev mode**: it pins wlan0 to
+  one AP *permanently* (persistent `wpa_supplicant-wlan0.conf` + enabled `wpa_supplicant@wlan0`
+  + `25-wlan0.network`), giving the device continuous internet for development — but the radio
+  stays associated, so the collector/submit opportunistic cycle can't use it. For **normal
+  operation** do *not* run `setup-wlan.sh`; instead register known networks with
+  `add-network.sh <SSID> [PSK] [PRIORITY]`, which appends a `network={}` block (PSK hashed
+  on-device) to the submit daemon's `/etc/gewgaw/networks.conf` and enables/connects nothing.
+  `gewgaw-submit` then associates *transiently* to a visible known/open AP during its
+  radio-lease window, uploads, and drops the link; the collector scans the rest of the time.
+  `add-network.sh` dedups by SSID (re-run to update), is runtime-only, and commits no secret.
+  If a device was previously put in dev mode, undo it before relying on the opportunistic
+  cycle: `rm /etc/wpa_supplicant/wpa_supplicant-wlan0.conf /etc/systemd/network/25-wlan0.network`
+  and `systemctl disable --now wpa_supplicant@wlan0`.
+
 When adding a feature to the image you generally add a recipe under
 `meta-gewgaw/recipes-*/` and append its package name to `IMAGE_INSTALL` in
 `build.sh`'s `managed_block()`.
