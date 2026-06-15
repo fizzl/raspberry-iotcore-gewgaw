@@ -9,7 +9,9 @@ gewgaw-submit does the real steady-state upload (candidate selection, \
 wpa_supplicant association, 204 connectivity check, batched publish via \
 aws-iot-mqtt) (phase 4) and the boot beacon (record a boot event, get online \
 with a larger budget, confirm NTP, flush events to .../status then sightings) \
-(phase 5). The per-BSSID net_health blacklist is a later phase."
+(phase 5). Candidate APs are scored by a per-BSSID net_health blacklist with \
+exponential-backoff cooldowns so the brief upload window isn't wasted on \
+dead/captive hotspots (phase 6, §9)."
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 

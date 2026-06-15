@@ -26,8 +26,11 @@ WAIT_FOR_SCAN for the collector's first scan, then connect with a larger lease
 and a BOOT_CONNECT_BUDGET retry budget, confirm NTPSynchronized, re-stamp the
 boot event with the corrected clock + link info, and flush events + sightings.
 
-Later phase (hooks marked inline): per-BSSID net_health blacklist (§9) and
-multi-network priority/reputation polish.
+Candidate reputation (§9): a per-BSSID net_health blacklist cools down APs that
+fail to associate / DHCP / pass the 204 check, with exponential backoff (gentler
+for configured PSK networks, harsher for captive portals), so the brief upload
+window isn't wasted re-trying dead hotspots. Each attempt is pinned to one BSSID
+so an open SSID present at many APs is judged per-AP.
 """
 import json
 import os
@@ -194,12 +197,13 @@ def parse_networks_conf(path):
     return nets
 
 
-def select_candidates(visible, known, allow_open):
+def select_candidates(visible, known, allow_open, blacklist=None):
     """Order APs to try: known PSK first (by priority/rssi), then open by rssi.
 
-    Phase 6 will additionally filter by net_health.cooldown_until and rank open
-    networks by reputation; here we only intersect "visible now" with config.
+    `blacklist` is the set of BSSIDs currently in net_health cooldown (§9); they
+    are dropped here so the short upload window isn't spent on known-dead APs.
     """
+    blacklist = blacklist or set()
     by_ssid = {n["ssid"]: n for n in known if n.get("ssid")}
     known_psk, known_open, disc_open = [], [], []
     seen_ssids = set()
@@ -208,6 +212,8 @@ def select_candidates(visible, known, allow_open):
         return c["rssi"] if c["rssi"] is not None else -999
 
     for ap in visible:
+        if ap["bssid"] in blacklist:
+            continue            # in cooldown (§9) — skip this AP
         ssid = ap.get("ssid")
         if not ssid:
             continue
@@ -231,6 +237,89 @@ def select_candidates(visible, known, allow_open):
     return known_psk + known_open + disc_open
 
 
+# --- net_health blacklist (§9) --------------------------------------------
+#
+# Per-BSSID uplink reputation so the brief upload window isn't wasted re-trying
+# dead/captive hotspots. On failure a BSSID gets an exponentially-backed-off
+# cooldown; a success clears it. Open networks get the full ladder (captive
+# portals start a rung higher — they're reliably useless to us); configured PSK
+# networks get a gentle ladder, since a known network failing is usually
+# transient. Re-probe is never permanent: the 7-day cap means a long-dead AP is
+# eventually retried once, and a single fresh failure re-arms the long backoff.
+
+OPEN_BACKOFF = [15 * 60, 60 * 60, 6 * 3600, 24 * 3600, 7 * 24 * 3600]
+PSK_BACKOFF = [5 * 60, 15 * 60, 30 * 60, 60 * 60]
+
+
+def backoff_seconds(fail_count, is_open, reason):
+    """Cooldown (s) after `fail_count` consecutive failures of a BSSID (§9)."""
+    if is_open:
+        ladder = OPEN_BACKOFF[1:] if reason == "captive" else OPEN_BACKOFF
+    else:
+        ladder = PSK_BACKOFF
+    idx = min(max(fail_count, 1), len(ladder)) - 1
+    return ladder[idx]
+
+
+def cooled_down_bssids(conn, now):
+    """Set of BSSIDs still in cooldown — dropped from candidate selection."""
+    rows = conn.execute(
+        "SELECT bssid FROM net_health WHERE cooldown_until > ?",
+        (now,)).fetchall()
+    return {r["bssid"] for r in rows}
+
+
+def net_in_cooldown(conn, bssid, now):
+    return conn.execute(
+        "SELECT 1 FROM net_health WHERE bssid = ? AND cooldown_until > ?",
+        (bssid, now)).fetchone() is not None
+
+
+def net_record_fail(conn, cand, reason, now):
+    """Bump a BSSID's consecutive-failure count and (re)arm its cooldown."""
+    row = conn.execute(
+        "SELECT fail_count FROM net_health WHERE bssid = ?",
+        (cand["bssid"],)).fetchone()
+    fail_count = (row["fail_count"] if row else 0) + 1
+    cooldown_until = now + backoff_seconds(fail_count, cand["is_open"], reason)
+    if row is None:
+        conn.execute(
+            "INSERT INTO net_health (bssid, ssid, is_open, last_attempt, "
+            "fail_count, last_fail_reason, cooldown_until) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (cand["bssid"], cand["ssid"], 1 if cand["is_open"] else 0, now,
+             fail_count, reason, cooldown_until))
+    else:
+        conn.execute(
+            "UPDATE net_health SET ssid = ?, is_open = ?, last_attempt = ?, "
+            "fail_count = ?, last_fail_reason = ?, cooldown_until = ? "
+            "WHERE bssid = ?",
+            (cand["ssid"], 1 if cand["is_open"] else 0, now, fail_count,
+             reason, cooldown_until, cand["bssid"]))
+    conn.commit()
+    return cooldown_until
+
+
+def net_record_success(conn, cand, now):
+    """Clear a BSSID's failure streak and cooldown after a good uplink."""
+    row = conn.execute(
+        "SELECT bssid FROM net_health WHERE bssid = ?",
+        (cand["bssid"],)).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO net_health (bssid, ssid, is_open, last_attempt, "
+            "last_success, fail_count, cooldown_until) "
+            "VALUES (?, ?, ?, ?, ?, 0, 0)",
+            (cand["bssid"], cand["ssid"], 1 if cand["is_open"] else 0, now, now))
+    else:
+        conn.execute(
+            "UPDATE net_health SET ssid = ?, is_open = ?, last_attempt = ?, "
+            "last_success = ?, fail_count = 0, last_fail_reason = NULL, "
+            "cooldown_until = 0 WHERE bssid = ?",
+            (cand["ssid"], 1 if cand["is_open"] else 0, now, now, cand["bssid"]))
+    conn.commit()
+
+
 # --- wpa_supplicant association -------------------------------------------
 
 def wpa_conf_path(iface):
@@ -247,10 +336,15 @@ def write_transient_conf(iface, cand):
             netblock = f'    psk={psk}\n'          # pre-hashed PSK, no quotes
         else:
             netblock = f'    psk="{psk}"\n'        # passphrase
+    # Pin the exact BSSID so each attempt connects to — and is judged by
+    # net_health (§9) as — the specific AP the collector saw. Open SSIDs like
+    # "xfinitywifi" exist at many BSSIDs with independent health.
+    bssid_line = f'    bssid={cand["bssid"]}\n' if cand.get("bssid") else ""
     body = ("ctrl_interface=/run/wpa_supplicant\n"
             "update_config=1\n"
             "network={\n"
             f'    ssid="{cand["ssid"]}"\n'
+            f"{bssid_line}"
             f"{netblock}"
             "}\n")
     path = wpa_conf_path(iface)
@@ -323,7 +417,7 @@ def teardown(iface):
         pass
 
 
-def connect_any(iface, cands, connect_timeout, url, deadline=None,
+def connect_any(iface, cands, connect_timeout, url, conn=None, deadline=None,
                 max_attempts=None):
     """Try candidates until one yields real internet; return the winner or None.
 
@@ -331,17 +425,25 @@ def connect_any(iface, cands, connect_timeout, url, deadline=None,
       * steady-state (§8): a single pass capped at `max_attempts`.
       * boot (§8.1): keep cycling the list until monotonic `deadline`, pausing
         between sweeps so a momentarily-out-of-range AP can be retried.
-    Phase 6 hook: per-BSSID net_health updates on each failure/success.
+    When `conn` is given, each attempt updates the per-BSSID net_health
+    reputation (§9): a failure arms an exponential cooldown, a success clears it.
+    A BSSID that falls into cooldown mid-run (e.g. across boot re-sweeps) is
+    skipped; if a whole sweep finds nothing left to try, we stop early.
     """
     if not cands:
         return None
     attempt = 0
     while True:
+        swept = 0
         for cand in cands:
             if deadline is not None and time.monotonic() >= deadline:
                 return None
             if max_attempts is not None and attempt >= max_attempts:
                 return None
+            if conn is not None and net_in_cooldown(
+                    conn, cand["bssid"], int(time.time())):
+                continue            # cooled down mid-run (§9)
+            swept += 1
             attempt += 1
             tag = (f"{cand['ssid']} ({cand['bssid']}, "
                    f"{'open' if cand['is_open'] else 'psk'})")
@@ -349,17 +451,25 @@ def connect_any(iface, cands, connect_timeout, url, deadline=None,
             ok, reason = associate(iface, cand, connect_timeout)
             if not ok:
                 log(f"  association failed: {reason}")
+                if conn is not None:
+                    net_record_fail(conn, cand, reason, int(time.time()))
                 teardown(iface)
-                continue            # Phase 6: net_health fail update
+                continue
             cok, creason = connectivity_reason(url, 15)
             if not cok:
                 log(f"  no internet: {creason}")
+                if conn is not None:
+                    net_record_fail(conn, cand, creason, int(time.time()))
                 teardown(iface)
-                continue            # Phase 6: net_health fail update
+                continue
             log(f"  online via {tag}")
-            return cand             # Phase 6: net_health success update
+            if conn is not None:
+                net_record_success(conn, cand, int(time.time()))
+            return cand
         if deadline is None:
             return None             # steady-state: one pass only
+        if swept == 0:
+            return None             # everything left is in cooldown
         if time.monotonic() >= deadline:
             return None
         time.sleep(5)              # boot budget remains; re-sweep the list
@@ -621,7 +731,8 @@ def upload_run(cfg):
         cands = select_candidates(
             visible_aps(conn, gap, now),
             parse_networks_conf(cfg["KNOWN_NETWORKS"]),
-            cfg["ALLOW_OPEN"] == "1")
+            cfg["ALLOW_OPEN"] == "1",
+            cooled_down_bssids(conn, now))
         if not cands:
             log("no usable AP visible right now; will retry next run")
             return 0
@@ -632,7 +743,8 @@ def upload_run(cfg):
             try:
                 winner = connect_any(
                     iface, cands, int(cfg["CONNECT_TIMEOUT"]),
-                    cfg["HTTP_CHECK_URL"], max_attempts=int(cfg["MAX_ATTEMPTS"]))
+                    cfg["HTTP_CHECK_URL"], conn=conn,
+                    max_attempts=int(cfg["MAX_ATTEMPTS"]))
                 if winner is not None:
                     # §10: flush events (boot beacons) first, then sightings.
                     flush_events(conn, base, batch)
@@ -672,8 +784,10 @@ def boot_run(cfg):
         wait_deadline = time.monotonic() + int(cfg["WAIT_FOR_SCAN"])
         cands = []
         while True:
+            now_s = int(time.time())
             cands = select_candidates(
-                visible_aps(conn, gap, int(time.time())), known, allow_open)
+                visible_aps(conn, gap, now_s), known, allow_open,
+                cooled_down_bssids(conn, now_s))
             if cands or time.monotonic() >= wait_deadline:
                 break
             time.sleep(3)
@@ -690,7 +804,7 @@ def boot_run(cfg):
                 budget = int(cfg["BOOT_CONNECT_BUDGET"])
                 winner = connect_any(
                     iface, cands, int(cfg["CONNECT_TIMEOUT"]),
-                    cfg["HTTP_CHECK_URL"],
+                    cfg["HTTP_CHECK_URL"], conn=conn,
                     deadline=time.monotonic() + budget)
                 if winner is None:
                     log(f"could not get online within {budget}s; "
